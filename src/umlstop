@@ -1,0 +1,229 @@
+#!/usr/bin/perl
+
+#
+# umlStop, Massimiliano Leone 2005, GPL Copyright <massimiliano.leone@studio.unibo.it> 
+# 
+# This is a free software: you can use, copy and 
+# modify respecting GPL license: 
+# http://www.gnu.org/copyleft/gpl.html
+# 
+
+
+use Getopt::Long;
+use strict;
+use Sys::Hostname;
+use Socket;
+use Net::IPv4Addr qw( :all );
+
+
+sub usage {
+        print STDERR
+"umlStop v.0.1 (CopyLeft) 2005 Massimiliano Leone
+
+UmlStop is a command line interface to stop a certain number of uml kernels.
+
+Usage:
+  UmlStop [options] stop --first-istance <first_istance> --last-istance <last_istance>
+
+  Stop	= halt more uml istance(s), sending a \"telinit 0\" command via ssh
+ 
+  Stop command wants always 2 options, at least:
+  They are:
+	-f|--first-istance	<first_hostip>	First istance's hostip 
+	-l|--last-istance	<last_hostip>	Last istance's hostip
+		
+	FAQ:
+	All umls are running in a C class subnet; so <hostip> is 
+	last entry of C class ip.
+		Example: istance = 1 => IP = 192.168.254.1,
+			with subnet = 192.168.254.0
+	You need only to specify <hostip>, because UmlStop retrieve 
+	alone all uml's ips from system, and it will use them 
+	to send \"halt\" command.
+	If instead you want use a different subnet's uml(s) 
+	where you're working on, you must specify this with -c.
+	
+	Umls will be stopped sequentially: 
+		example: with \"--first-istance 1\" and \"--last-istance 33\"
+		  (and subnet 192.168.254.0) $0 will halt 33 kernels with 
+		  ip = 192.168.254.XXX, starting from \"1\" and ending to \"33\".
+		
+Options:
+  -c|--classIp			Use different C class instead of you're working on
+  -t|--test			Only print command(s)
+  -v|--verbose			Print command line
+";
+        exit 1;
+}
+
+my ($command,$run);
+my ($first,$last,$classIpGiven);
+my ($test,$verbose);
+
+GetOptions ( 
+	"first|f=s"				=> \$first,
+	"last|l=s"				=> \$last,
+	"classIp|c=s"			=> \$classIpGiven,
+	"test|t"				=> \$test,
+	"verbose|v"				=> \$verbose,
+	"help|h"                => \&usage,
+) || usage();
+
+
+sub getClassAndHostIp {
+	
+	my $classIpGiven = shift(@_);
+	my $firstHostIp = shift(@_);
+	my $lastHostIp = shift(@_);
+	
+	my $classIp;
+	
+	if ($classIpGiven) {
+		$classIp = new Net::IP ( $classIpGiven.'/24',4) || die "$! \n";
+		
+		if ($classIp->iptype() =~ "PUBLIC") {
+			print "Class wrong: it is a public class.\n";
+			exit 1;
+		}
+		else {
+			$classIp = (split ( /\//, $classIp->print() ))[0];
+		}
+		return $classIp;
+	}
+	else { #current subnet 
+	
+		my $myHostname = hostname();
+		my $myIpFromHostname = inet_ntoa(inet_aton($myHostname))	|| die "Couldn't resolve $myHostname : $!";
+	
+		#print "$myHostname $myIpFromHostname\n";
+		my ($ip,$cidr) = ipv4_parse( $myIpFromHostname."/24" );
+		my @hostIpArray = split ( /\./, $ip );
+		
+		my $hostIp = $hostIpArray[3];
+		$classIp = "$hostIpArray[0]\.$hostIpArray[1]\.$hostIpArray[2]";
+		
+		if ($hostIp >= $firstHostIp && $hostIp <= $lastHostIp) {
+			return $classIp,$hostIp;
+		}
+		else {
+			return $classIp;
+		}
+	}
+}
+
+sub customExit {
+	my $errorReason = shift (@_);
+	print $errorReason;
+	print "See --help\n";
+	exit 1;
+}
+
+sub launchForking {
+	my $run = shift (@_);
+	
+	my $pid = fork();
+	if ($pid) {
+		if ($test) {
+			print "$run\n";
+			exit 0;
+		}
+		if ($verbose) {
+			print "$run\n";
+			exec ($run);
+			exit 0;
+		}
+		exec ($run);
+		exit 0;
+	}
+	waitpid($pid,0);
+}
+
+sub sendHalt {
+	my $classIp = shift (@_);
+	my $hostIp = shift (@_);
+	
+	my $ip = $classIp."\.".$hostIp;
+	$run = "ssh -o StrictHostKeyChecking=no root\@$ip 'telinit 0' &";
+	
+	print "Stopping $ip \n";
+
+	launchForking($run);
+	sleep (2);
+}
+
+
+
+#
+# sanity check
+#
+
+unless ($ARGV[0] eq "stop") {
+	customExit("Error: You must use \"stop\" command!\n");
+}
+
+if ($first < 1)  {
+	customExit("First_istance hostip $first not valid: it must be greater than 0\n");
+}
+if ($last > 254) { 
+	customExit("Last_istance hostip $last not valid: it must be smaller than 255\n");
+}
+
+if ($first && !$last || !$first && $last) {
+	if ($first == 0) {
+		customExit("Hostip $first not valid: it must be between 1 and 254\n");
+	}
+	customExit("Error: Halting more uml istances requires you specify 
+	--first-istance <istance> and --last-istance <istance> together\.\n");
+}
+
+if (!$first && !$last) {
+	if ($first == 0) {
+		customExit("Hostip $first not valid: it must be between 1 and 254\n");
+	}
+	customExit("Error: Halting more uml istances requires you specify
+	--first-istance <istance> and --last-istance <istance> together\.\n");
+}
+
+if ($first > $last) {
+	customExit("Error: <first_istance> must be minus than <last_istance>\n");
+}
+
+
+$command = $ARGV[0];
+
+my $firstHostIp = $first;
+my $lastHostIp = $last;
+my ($classIp,$myHostIp);
+($classIp,$myHostIp) = getClassAndHostIp($classIpGiven,$firstHostIp,$lastHostIp);
+#print $myHostIp;
+
+if ($myHostIp) { #i'm stopping also current istance
+	if ($myHostIp != $firstHostIp) {
+		#stopping from first to current uml
+		for (my $hostIp = $firstHostIp; $hostIp < $myHostIp; $hostIp++) {
+			sendHalt($classIp,$hostIp);
+		}
+		#stopping from current+1 uml to last
+		for (my $hostIp = $myHostIp+1; $hostIp <= $lastHostIp; $hostIp++) {
+			sendHalt($classIp,$hostIp);
+		}
+		print "...now halting this!\n";
+		launchForking("telinit 0");
+	}
+	elsif ($myHostIp == $firstHostIp) { #i'm stopping when current istance is $first
+		#stopping from current_uml+1 to last
+		for (my $hostIp = $firstHostIp+1; $hostIp <= $lastHostIp; $hostIp++) {
+			sendHalt($classIp,$hostIp);
+		}
+		print "...now halting this!\n";
+		launchForking("telinit 0");
+	} ### end "current istance"
+}
+else { #i'm stopping other istances
+	for (my $hostIp = $firstHostIp; $hostIp <= $lastHostIp; $hostIp++) {
+		sendHalt($classIp,$hostIp);
+	}
+}
+
+
+exit 0

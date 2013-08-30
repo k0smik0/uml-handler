@@ -1,0 +1,10 @@
+#!/bin/sh
+
+# parsing argument
+COMMAND=$(cat /proc/cmdline | awk  -v RS="exec=" '{ print }' | grep -v root | head -1 | sed "s/'//g")
+
+# executing
+echo "Executing: $COMMAND ..."
+echo ""
+$COMMAND
+echo "...done."

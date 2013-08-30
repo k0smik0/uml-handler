@@ -1,0 +1,396 @@
+#!/usr/bin/perl
+
+#
+# umlHandler, Massimiliano Leone 2005, GPL Copyright 
+# 
+# This is a free software: you can use, copy and 
+# modify respecting GPL license: 
+# http://www.gnu.org/copyleft/gpl.html
+# 
+
+
+use Getopt::Long;
+use strict;
+use Net::IP;
+
+
+sub usage {
+        print STDERR
+"umlStart v.0.1 (CopyLeft) 2005 Massimiliano Leone
+
+UmlStart is a command line interface to start and stop a certain number of uml kernels.
+
+Usage:
+  $0 [options] command
+  $0 [options] start|stop <single_istance>
+  $0 [options] start --first-istance <first_istance> --last-istance <last_istance>
+  $0 [options] stop --first-istance <first_istance> --last-istance <last_istance>
+
+Commands:
+  start - start 1 or more uml istance(s)
+  stop	- stop 1 or more uml istance(s), sending a \"telinit 0\" command via ssh
+ 
+  start and stop commands wants always an option, at least:
+  There could be:
+	-i|--istance 		<istance>	Single uml istance's hostname
+   or, if you want starting more kernels:
+	-f|--first-istance	<istance>	First istance's hostname 
+	-l|--last-istance	<istance>	Last istance's hostname
+		
+	FAQ:
+	 <istance> is always hostname of uml you're starting, and 
+	   it must have a form as <name_you_like_with_small_char-number>: 
+	   Number will be hostip, in private C class subnet [default: 192.168.254.0]
+		Example: istance = uml-1 => IP = 192.168.254.1
+	   Running more kernels, they will be started with sequential ips: 
+		example: with \"--first-istance uml-1\" and \"--last-istance uml-33\"
+		  umlStart will start 33 kernels with hostname = uml-XXX
+		  and ip = 192.168.254.XXX, where 1 <= XXX <= 33.
+	  umlHandler use vde_switch to make possible communication between uml istances:
+	  	if you want permit \"vertical\" communication, that is between umls and
+		host box, you have to set up a virtual tap interface (and you need root
+		privileges to do it). Without tap, in example, you're not able to exec
+		stop command, and send \"telinit 0\" to umls via ssh.
+		
+Options:
+  [only for \"start\" command]
+  -d|--dir			Use custom directory to store .cow files [default: current dir]
+  -s|--socket			Use custom pipe instead of /tmp/vde.ctl
+  -c|--classIp			Use custom C class instead of default \"192.168.254.0\"
+  -n|--no-xterm			Don't use xterm [only with -i]
+  -o|--other-parameters		Other parameters [i.e.: another eth device]
+  -e|--exec			A command to be run: it must be between tick [' ']
+  -q|--quiet			uml will be started in quiet mode
+  [for \"start\" and \"stop\" command]
+  -t|--test			Only print command(s)
+  -v|--verbose			Print command line
+
+At least you must specify one command: \"start\" or \"stop.\" \n";
+        exit 1;
+}
+
+my ($command);
+my ($istance,$fsIstance,$run);
+my ($first,$last,$classIpGiven,$dirGiven,$socket);
+my ($noXterm,$quiet,$otherParameters,$execGiven);
+my ($test,$verbose);
+
+GetOptions ( 
+	"istance|i=s"				=> \$istance,
+	"first|f=s"					=> \$first,
+	"last|l=s"					=> \$last,
+	"classIp|c=s"				=> \$classIpGiven,
+	"dir|d=s"					=> \$dirGiven,
+	"socket|s=s"            => \$socket,
+	"no-xterm|n"           	=> \$noXterm,
+	"other-parameters|o=s"	=> \$otherParameters,
+	"exec|e=s"					=> \$execGiven,
+	"quiet|q"					=> \$quiet,
+	"test|t"						=> \$test,
+	"verbose|v"					=> \$verbose,
+	"help|h"                => \&usage,
+) || usage();
+
+
+sub checkIstance {
+	my $istance = shift(@_);
+	
+	if ($istance =~ /^[a-z]+-[0-9]+$/) {
+		my @a = split( /-/, $istance);
+		my $hostnameTemplate = $a[0];
+		my $hostIp = $a[1]; 
+		if ( (($hostIp < 1) || ($hostIp > 254)) )  {
+			customExit("IP $hostIp not valid: it must be between 1 and 254\n");
+		}
+		else {
+			return $hostnameTemplate,$hostIp;
+		}
+	}
+	else {
+		customExit("Error in istance name\n");
+	}
+}
+
+sub buildHeadCommand {
+	my $hostnameTemplate = shift(@_);
+	my $hostIp = shift(@_);
+	my $dir;
+	
+	if ($dirGiven) {
+		if ($dirGiven =~ /^\/*[a-zA-Z0-9_\-]+$/) {
+			$dir = $dirGiven."/";
+		}
+		else {
+			$dir = $dirGiven;
+		}
+	}
+	
+	my $headCommand = "./linux ubd0=".$dir.$hostnameTemplate."-"."$hostIp\.cow".",root_fs devfs=nomount ";
+	return $headCommand;
+}
+
+sub getSocket  {
+	my $socket = shift(@_);
+		
+	if (!$socket) { 
+		$socket = "/tmp/vde.ctl"
+	}
+	if (! -e $socket) {
+		print "Warning: socket $socket not found; no network support.\n"
+	}
+	return "eth0=daemon,,,$socket ";
+}
+
+sub checkAndGetExec {
+	my $exec;
+	
+	if ($execGiven) {
+		$exec = "exec='$execGiven' "; 
+		return $exec;
+	}
+}
+
+sub buildTailCommand {
+	my $tailCommand = getSocket($socket)." $otherParameters ".checkAndGetExec($execGiven);
+	return $tailCommand;
+}
+
+sub getClassIp {
+	
+	sub setDefaultClassIp {
+		print (shift(@_));
+		print " default [192.168.254] will be used\n";
+		my $defaultClassIp = "192.168.254";
+		return $defaultClassIp;
+	}
+	
+	my $classIpGiven = shift(@_);
+	my $classIp;
+	
+	if ($classIpGiven) {
+		$classIp = new Net::IP ( $classIpGiven.'/24',4) 
+			|| die "Error: $classIpGiven is a bad class\nSee --help\n";
+		
+		if ($classIp->iptype() =~ "PUBLIC") {
+			$classIp = setDefaultClassIp("Class ip forbidden (public class),");
+		}
+		else {
+			$classIp = (split ( /\//, $classIp->print() ))[0];
+		}
+	}
+	else {
+		$classIp = setDefaultClassIp("Warning: Class ip not given,");
+	}
+	return $classIp;
+}
+
+sub checkTapExist {
+	my $errorReason = shift (@_);
+	
+	my $ifconfig = `ifconfig`;
+	
+	if ( !($ifconfig =~ /tap[0-9]/) ) {
+		customExit($errorReason);
+	}	
+}
+
+sub customExit {
+	my $errorReason = shift (@_);
+	print $errorReason;
+	print "See --help\n";
+	exit 1;
+}
+
+
+#
+# sanity check
+#
+if ($noXterm && $quiet) {
+	customExit("Error: You can't use --no-xterm with --quiet\n");
+}
+
+if ($first && $noXterm || $last && $noXterm) {
+	customExit("Error: You can't use --no-xterm with --first or --last:
+	You can't start many umls without xterm\n");
+}
+
+if ($istance && $first || $istance && $last) {
+	customExit("Error: You can't use --istance with --first or --last: 
+	--istance means \"one uml will be started (or stopped).\"\n");
+}
+
+if ($first && !$last || !$first && $last) {
+	customExit("Error: Starting more uml istances requires you specify
+	--first-istance <istance> and --last-istance <istance>\.\n");
+}
+
+if ($ARGV[0] eq "stop") {
+	if ($dirGiven || $execGiven || $otherParameters || $noXterm || $quiet) { 
+		customExit("Error: options \"-d,-e,-o,-c,-n,-s,-q\" are allowed only with \"start\" command\n"); 
+	}
+}
+
+
+unless ($ARGV[0] eq "start" || $ARGV[0] eq "stop") {
+	customExit("Error: You must specify a command at least!\n");
+}
+
+
+$command = $ARGV[0];
+
+my ($hostnameTemplate,$classIp);
+my ($headCommand,$tailCommand);
+$classIp = getClassIp($classIpGiven);
+
+if ($command eq "start") { ### starting 
+
+	if ($istance) { #single istance
+	
+		($hostnameTemplate,my $hostIp) = checkIstance($istance);
+		
+		$headCommand = buildHeadCommand($hostnameTemplate,$hostIp);
+		$tailCommand = buildTailCommand($socket,$otherParameters,$execGiven);
+		
+		if ($noXterm) {
+			print "uml will starting only with internal console\n";
+			$tailCommand .= "con=pty pty0=fd:0,fd:1 ";
+		}
+		
+		my $run = $headCommand.$tailCommand."hostname=".$hostnameTemplate."-".$hostIp." ip=$classIp\.$hostIp ";
+	
+		if ($quiet) {
+			$run .= "con= con0=xterm &";
+		}
+		if ($test) {
+			print "$run\n";
+			exit 0;
+		}
+		if ($verbose) {
+			print "Starting $hostnameTemplate-$hostIp $classIp\.$hostIp\n";
+			print "$run\n";
+			exec ($run) || die "Error in exec: $!";
+			exit 0;
+		}
+		else {
+			print "Starting $hostnameTemplate-$hostIp $classIp\.$hostIp\n";
+			exec ($run) || die "Error in exec: $!";
+			exit 0;
+		}
+	} ##end single istance
+	if ($first && $last) { #more istances
+	
+		my ($hostnameTemplate,$firstHostIp) = checkIstance($first);
+		($hostnameTemplate,my $lastHostIp) = checkIstance($last);
+		if ($firstHostIp > $lastHostIp) {
+			customExit("Error: <first_istance-hostIp> must be minus than <last_istance-hostIp>\n
+			See --help\n");
+		}
+		$tailCommand = buildTailCommand($socket,$otherParameters,$execGiven);
+		
+		print "\n\nStarting umls from $firstHostIp to $lastHostIp \n\n";
+
+		for (my $hostIp = $firstHostIp; $hostIp <= $lastHostIp; $hostIp++) {
+		
+			my $ip = $classIp."\.".$hostIp;
+			my $headCommand = buildHeadCommand($hostnameTemplate,$hostIp);
+			$run = $headCommand.$tailCommand."con= con0=xterm "."hostname=".$hostnameTemplate."-"."$hostIp ip=$ip &";
+			
+			print "Starting ".$hostnameTemplate."-".$hostIp." $ip \n";
+	
+			my $pid = fork();
+			if ($pid) {
+				if ($test) {
+					print "$run\n";
+					exit 0;
+				}
+				if ($verbose) {
+					print "$run\n";
+					exec ($run);
+					exit 0;
+				}
+				exec ($run);
+				exit 0;
+			}
+			waitpid($pid,0);
+			sleep (2);
+		} #end for
+		exit 0;	
+	}
+	else { #not istance nor first & last
+		customExit("Error: required --istance <istance> 
+		or 
+		--first-istance <first_istance> --last-istance <last_istance>\n");
+	}
+} ## end start
+
+if ($command eq "stop") { ### stopping 
+
+	checkTapExist("No tap interface found,it's not possible send \"halt\" command via ssh\n");
+	
+	if ($istance) { #single istance
+	
+		($hostnameTemplate,my $hostIp) = checkIstance($istance);
+		my $ip = $classIp."\.".$hostIp;
+		my $run = "ssh root\@$ip 'telinit 0' &";
+		
+		if ($test) {
+			print "$run\n";
+			exit 0;
+		}
+		if ($verbose) {
+			print "Stopping $hostnameTemplate-$hostIp $classIp\.$hostIp\n";
+			print "$run\n";
+			exec ($run) || die "Error in exec: $!";
+			exit 0;
+		}
+		else {
+			print "Stopping $hostnameTemplate-$hostIp $classIp\.$hostIp\n";
+			exec ($run) || die "Error in exec: $!";
+			exit 0;
+		}
+
+	} ##end single istance
+	if ($first && $last) { #more istances
+		
+		my ($hostnameTemplate,$firstHostIp) = checkIstance($first);
+		($hostnameTemplate,my $lastHostIp) = checkIstance($last);
+		
+		if ($firstHostIp > $lastHostIp) {
+			customExit("Error: <first_istance-hostIp> must be minus than <last_istance-hostIp>\n
+			See --help\n");
+		}
+		
+		for (my $hostIp = $firstHostIp; $hostIp <= $lastHostIp; $hostIp++) {
+		
+			my $ip = $classIp."\.".$hostIp;
+			$run = "ssh root\@$ip 'telinit 0' &";
+			
+			print "Stopping ".$hostnameTemplate."-".$hostIp." $ip \n";
+	
+			my $pid = fork();
+			if ($pid) {
+				if ($test) {
+					print "$run\n";
+					exit 0;
+				}
+				if ($verbose) {
+					print "$run\n";
+					exec ($run);
+					exit 0;
+				}
+				exec ($run);
+				exit 0;
+			}
+			waitpid($pid,0);
+			sleep (2);
+		} #end for
+		exit 0;
+	}
+	else { #not istance nor first & last
+		customExit("Error: required --istance <istance> 
+		or 
+		--first-istance <first_istance> --last-istance <last_istance>\n");
+	}
+}
+
+exit 0

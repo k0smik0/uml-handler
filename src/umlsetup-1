@@ -1,0 +1,58 @@
+#!/bin/sh
+
+#
+# parsing arguments
+#
+HOSTNAME=$(cat /proc/cmdline | awk -v FS== -v RS=' ' '{if($1=="hostname") print $2}')
+TITLE=$(cat /proc/cmdline | awk -v FS== -v RS=' ' '{if($1=="title") print $2}')
+IP=$(cat /proc/cmdline | awk -v FS== -v RS=' ' '{if($1=="ip") print $2}')
+
+#
+# configure terminal window title
+#
+echo "Setting terminal title to $HOSTNAME"
+/bin/echo -ne "\033]2;${HOSTNAME}\007"
+
+
+#
+# configure hostname and /etc/hosts
+#
+echo "Modifying /etc/hostname with new hostname: $HOSTNAME ..."
+echo $HOSTNAME > /etc/hostname
+hostname --file /etc/hostname
+echo "...done."
+
+CLASS=`echo $IP | cut -d"." -f 1,2,3`
+HOSTNAME_TEMPLATE=`echo $HOSTNAME | cut -d"-" -f 1`
+
+echo "Modifying /etc/hosts ..."
+echo 127.0.0.1 localhost > /etc/hosts
+echo "" >> /etc/hosts
+for i in `seq 1 254`
+do
+	echo $CLASS.$i $HOSTNAME_TEMPLATE-$i >> /etc/hosts
+done
+echo "...done."
+
+#
+# configure ip
+#
+
+echo "Modifying /etc/network/interfaces..."
+
+cat <<EOF > /etc/network/interfaces
+# Used by ifup(8) and ifdown(8). See the interfaces(5) manpage or
+# /usr/share/doc/ifupdown/examples for more information.
+
+auto lo 
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+	address $IP
+	netmask 255.255.255.0
+	network $CLASS.0
+	broadcast $CLASS.255
+EOF
+
+echo "...done."
